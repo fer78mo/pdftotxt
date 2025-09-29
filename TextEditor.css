@@ -1,0 +1,49 @@
+.text-editor {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    font-family: Arial, sans-serif;
+}
+
+.text-editor__controls {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px;
+    background-color: #f1f1f1;
+}
+
+.text-editor__control {
+    margin-right: 10px;
+}
+
+.text-editor__marker-selection {
+    display: flex;
+    align-items: center;
+    padding: 10px;
+}
+
+.text-editor__marker {
+    width: 20px;
+    height: 20px;
+    border: 1px solid #ccc;
+    margin-right: 5px;
+    cursor: pointer;
+}
+
+.text-editor__preview {
+    flex: 1;
+    padding: 20px;
+    background-color: #fff;
+    border: 1px solid #ccc;
+    overflow-y: auto;
+}
+
+@media (max-width: 768px) {
+    .text-editor {
+        flex-direction: column;
+    }
+
+    .text-editor__controls {
+        flex-direction: column;
+    }
+}
