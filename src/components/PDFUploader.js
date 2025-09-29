@@ -13,7 +13,7 @@ const PDFUploader = ({ onFileUpload }) => {
         // Crear un objeto URL para el PDF
         const fileUrl = URL.createObjectURL(file);
         
-        // Simular extracción de texto (en producción usar pdf-parse)
+        // Extraer texto con detección mejorada de encabezados/pies
         const text = await extractTextFromPDF(file);
         
         onFileUpload(file, text);
@@ -39,25 +39,24 @@ const PDFUploader = ({ onFileUpload }) => {
             throw new Error('PDF.js no está disponible. Por favor, recarga la página.');
           }
           
-          // Usar PDF.js para extraer texto y metadatos estructurales del PDF
           const pdfjsLib = window['pdfjs-dist/build/pdf'];
-          
-          // Configurar el worker de PDF.js
           pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
           
           const typedarray = new Uint8Array(e.target.result);
           const pdf = await pdfjsLib.getDocument({ data: typedarray }).promise;
           
-          let fullText = '';
-          const structuralData = []; // Almacenar datos estructurales
+          // Primera pasada: analizar todo el documento para detectar patrones globales
+          const globalAnalysis = await analyzeGlobalPatterns(pdf);
           
-          // Extraer texto y metadatos de cada página
+          let cleanText = '';
+          const structuralData = [];
+          
+          // Segunda pasada: extraer texto limpio basado en el análisis global
           for (let i = 1; i <= pdf.numPages; i++) {
             const page = await pdf.getPage(i);
             const textContent = await page.getTextContent();
             const viewport = page.getViewport({ scale: 1.0 });
             
-            // Obtener información estructural de la página
             const pageInfo = {
               pageNumber: i,
               width: viewport.width,
@@ -65,112 +64,32 @@ const PDFUploader = ({ onFileUpload }) => {
               items: []
             };
             
-            // Agrupar texto por líneas con información estructural completa
-            const lines = {};
-            let currentLine = '';
-            let lastY = null;
-            let currentLineData = [];
+            // Procesar líneas con detección mejorada
+            const processedLines = processPageLines(textContent.items, viewport, globalAnalysis);
             
-            textContent.items.forEach(item => {
-              // Extraer información estructural completa
-              const x = item.transform[4]; // Posición X
-              const y = item.transform[5]; // Posición Y
-              const fontSize = Math.abs(item.transform[0]); // Tamaño de fuente
-              const fontStyle = item.fontName || 'unknown';
+            processedLines.forEach(line => {
+              pageInfo.items.push(line);
               
-              const lineKey = Math.round(y);
-              
-              if (lastY === null || Math.abs(y - lastY) < 5) {
-                // Misma línea o línea muy cercana
-                currentLine += (currentLine ? ' ' : '') + item.str;
-                currentLineData.push({
-                  text: item.str,
-                  x: x,
-                  y: y,
-                  fontSize: fontSize,
-                  fontStyle: fontStyle,
-                  width: item.width || 0,
-                  height: item.height || 0
-                });
-              } else {
-                // Nueva línea - guardar la anterior con metadatos
-                if (currentLine.trim()) {
-                  fullText += currentLine.trim() + '\n';
-                  
-                  // Analizar si esta línea parece ser encabezado/pie basándose en múltiples factores
-                  const isHeaderFooter = analyzeStructuralElements(currentLineData, pageInfo, viewport);
-                  
-                  if (!isHeaderFooter) {
-                    pageInfo.items.push({
-                      text: currentLine.trim(),
-                      lineData: currentLineData,
-                      isHeaderFooter: false
-                    });
-                  } else {
-                    pageInfo.items.push({
-                      text: currentLine.trim(),
-                      lineData: currentLineData,
-                      isHeaderFooter: true,
-                      headerFooterType: isHeaderFooter.type,
-                      confidence: isHeaderFooter.confidence
-                    });
-                  }
-                }
-                
-                currentLine = item.str;
-                currentLineData = [{
-                  text: item.str,
-                  x: x,
-                  y: y,
-                  fontSize: fontSize,
-                  fontStyle: fontStyle,
-                  width: item.width || 0,
-                  height: item.height || 0
-                }];
+              // Solo agregar al texto final si NO es encabezado/pie de página
+              if (!line.isHeaderFooter) {
+                cleanText += line.text + '\n';
               }
-              
-              lastY = y;
             });
             
-            // Procesar la última línea
-            if (currentLine.trim()) {
-              fullText += currentLine.trim() + '\n';
-              
-              const isHeaderFooter = analyzeStructuralElements(currentLineData, pageInfo, viewport);
-              
-              if (!isHeaderFooter) {
-                pageInfo.items.push({
-                  text: currentLine.trim(),
-                  lineData: currentLineData,
-                  isHeaderFooter: false
-                });
-              } else {
-                pageInfo.items.push({
-                  text: currentLine.trim(),
-                  lineData: currentLineData,
-                  isHeaderFooter: true,
-                  headerFooterType: isHeaderFooter.type,
-                  confidence: isHeaderFooter.confidence
-                });
-              }
-            }
-            
             structuralData.push(pageInfo);
-            fullText += '\n'; // Separador entre páginas
           }
           
           // Guardar datos estructurales para análisis posterior
           window.pdfStructuralData = structuralData;
+          window.pdfGlobalAnalysis = globalAnalysis;
           
-          // Si no se extrajo texto, intentar con un método alternativo
-          if (!fullText.trim()) {
-            fullText = await extractTextWithFallback(file);
-          }
+          // Post-procesamiento: limpiar texto extraído
+          const finalText = postProcessExtractedText(cleanText, globalAnalysis);
           
-          resolve(fullText);
+          resolve(finalText || 'No se pudo extraer texto del PDF');
+          
         } catch (error) {
           console.error('Error al extraer texto del PDF:', error);
-          // Intentar método de respaldo
           const fallbackText = await extractTextWithFallback(file);
           resolve(fallbackText);
         }
@@ -183,135 +102,352 @@ const PDFUploader = ({ onFileUpload }) => {
       reader.readAsArrayBuffer(file);
     });
   };
-  
-  // Nueva función para analizar elementos estructurales y detectar encabezados/pies
-  const analyzeStructuralElements = (lineData, pageInfo, viewport) => {
-    if (!lineData || lineData.length === 0) return false;
+
+  // NUEVA FUNCIÓN: Análisis global de patrones en todo el documento
+  const analyzeGlobalPatterns = async (pdf) => {
+    const analysis = {
+      headerPatterns: new Set(),
+      footerPatterns: new Set(),
+      repeatingElements: new Map(),
+      commonPositions: {
+        headers: [],
+        footers: []
+      },
+      documentInfo: {
+        totalPages: pdf.numPages,
+        avgFontSize: 0,
+        commonFonts: new Map()
+      }
+    };
+
+    const allPageElements = [];
+    let totalFontSize = 0;
+    let fontCount = 0;
+
+    // Analizar todas las páginas para encontrar patrones
+    for (let i = 1; i <= Math.min(pdf.numPages, 10); i++) { // Analizar max 10 páginas para velocidad
+      const page = await pdf.getPage(i);
+      const textContent = await page.getTextContent();
+      const viewport = page.getViewport({ scale: 1.0 });
+      
+      const lines = groupTextIntoLines(textContent.items, viewport);
+      
+      lines.forEach(line => {
+        // Recopilar información de fuentes
+        line.items.forEach(item => {
+          totalFontSize += item.fontSize;
+          fontCount++;
+          
+          const font = analysis.documentInfo.commonFonts.get(item.fontStyle) || 0;
+          analysis.documentInfo.commonFonts.set(item.fontStyle, font + 1);
+        });
+
+        // Detectar elementos que se repiten en múltiples páginas
+        const lineKey = `${Math.round(line.relativeY * 100)}_${line.text.slice(0, 20)}`;
+        const existing = analysis.repeatingElements.get(lineKey) || { count: 0, text: line.text, positions: [] };
+        existing.count++;
+        existing.positions.push({ page: i, y: line.relativeY });
+        analysis.repeatingElements.set(lineKey, existing);
+
+        // Clasificar posiciones comunes de headers/footers
+        if (line.relativeY < 0.15) {
+          analysis.commonPositions.headers.push({ page: i, y: line.relativeY, text: line.text });
+        } else if (line.relativeY > 0.85) {
+          analysis.commonPositions.footers.push({ page: i, y: line.relativeY, text: line.text });
+        }
+
+        allPageElements.push({
+          page: i,
+          ...line
+        });
+      });
+    }
+
+    // Calcular estadísticas
+    analysis.documentInfo.avgFontSize = totalFontSize / fontCount;
+
+    // Identificar patrones de elementos repetitivos
+    analysis.repeatingElements.forEach((element, key) => {
+      if (element.count >= Math.min(3, Math.ceil(pdf.numPages * 0.3))) { // Se repite en al menos 30% de páginas
+        const avgY = element.positions.reduce((sum, pos) => sum + pos.y, 0) / element.positions.length;
+        
+        if (avgY < 0.15) {
+          analysis.headerPatterns.add(element.text);
+        } else if (avgY > 0.85) {
+          analysis.footerPatterns.add(element.text);
+        }
+      }
+    });
+
+    return analysis;
+  };
+
+  // FUNCIÓN MEJORADA: Agrupar texto en líneas con mejor precisión
+  const groupTextIntoLines = (items, viewport) => {
+    const lines = [];
+    const lineThreshold = 5; // Píxeles de tolerancia para considerar misma línea
     
-    let headerFooterScore = 0;
-    let evidence = [];
+    // Agrupar items por posición Y
+    const grouped = {};
     
-    // Análisis 1: Posición en la página
-    const avgY = lineData.reduce((sum, item) => sum + item.y, 0) / lineData.length;
-    const relativeY = avgY / viewport.height;
+    items.forEach(item => {
+      const x = item.transform[4];
+      const y = item.transform[5];
+      const fontSize = Math.abs(item.transform[0]);
+      const fontStyle = item.fontName || 'unknown';
+      
+      const yKey = Math.round(y / lineThreshold) * lineThreshold;
+      
+      if (!grouped[yKey]) {
+        grouped[yKey] = [];
+      }
+      
+      grouped[yKey].push({
+        text: item.str,
+        x: x,
+        y: y,
+        fontSize: fontSize,
+        fontStyle: fontStyle,
+        width: item.width || 0,
+        height: item.height || 0
+      });
+    });
     
-    if (relativeY < 0.1) {
-      headerFooterScore += 3;
+    // Convertir grupos en líneas ordenadas
+    Object.keys(grouped)
+      .sort((a, b) => parseFloat(b) - parseFloat(a)) // Orden descendente (top to bottom)
+      .forEach(yKey => {
+        const lineItems = grouped[yKey].sort((a, b) => a.x - b.x); // Orden por X
+        const text = lineItems.map(item => item.text).join(' ').trim();
+        
+        if (text) {
+          const avgY = lineItems.reduce((sum, item) => sum + item.y, 0) / lineItems.length;
+          
+          lines.push({
+            text: text,
+            items: lineItems,
+            y: avgY,
+            relativeY: avgY / viewport.height,
+            avgFontSize: lineItems.reduce((sum, item) => sum + item.fontSize, 0) / lineItems.length,
+            totalWidth: lineItems.reduce((sum, item) => sum + item.width, 0)
+          });
+        }
+      });
+    
+    return lines;
+  };
+
+  // FUNCIÓN MEJORADA: Procesar líneas de página con detección avanzada
+  const processPageLines = (items, viewport, globalAnalysis) => {
+    const lines = groupTextIntoLines(items, viewport);
+    const processedLines = [];
+    
+    lines.forEach(line => {
+      const headerFooterAnalysis = advancedHeaderFooterDetection(line, viewport, globalAnalysis);
+      
+      processedLines.push({
+        text: line.text,
+        lineData: line.items,
+        isHeaderFooter: headerFooterAnalysis.isHeaderFooter,
+        headerFooterType: headerFooterAnalysis.type,
+        confidence: headerFooterAnalysis.confidence,
+        evidence: headerFooterAnalysis.evidence,
+        y: line.y,
+        relativeY: line.relativeY
+      });
+    });
+    
+    return processedLines;
+  };
+
+  // FUNCIÓN MEJORADA: Detección avanzada de encabezados y pies de página
+  const advancedHeaderFooterDetection = (line, viewport, globalAnalysis) => {
+    let score = 0;
+    const evidence = [];
+    let type = 'content';
+
+    // 1. ANÁLISIS DE POSICIÓN (peso alto)
+    if (line.relativeY < 0.08) {
+      score += 5;
+      evidence.push('posición muy superior');
+      type = 'header';
+    } else if (line.relativeY < 0.15) {
+      score += 3;
       evidence.push('posición superior');
-    } else if (relativeY > 0.9) {
-      headerFooterScore += 3;
+      type = 'header';
+    } else if (line.relativeY > 0.92) {
+      score += 5;
+      evidence.push('posición muy inferior');
+      type = 'footer';
+    } else if (line.relativeY > 0.85) {
+      score += 3;
       evidence.push('posición inferior');
+      type = 'footer';
     }
+
+    // 2. ANÁLISIS DE PATRONES REPETITIVOS (peso alto)
+    const isRepeatingHeader = globalAnalysis.headerPatterns.has(line.text);
+    const isRepeatingFooter = globalAnalysis.footerPatterns.has(line.text);
     
-    // Análisis 2: Tamaño de fuente
-    const avgFontSize = lineData.reduce((sum, item) => sum + item.fontSize, 0) / lineData.length;
-    if (avgFontSize < 8 || avgFontSize > 20) {
-      headerFooterScore += 2;
-      evidence.push('tamaño de fuente atípico');
+    if (isRepeatingHeader) {
+      score += 6;
+      evidence.push('patrón repetitivo de encabezado');
+      type = 'header';
+    } else if (isRepeatingFooter) {
+      score += 6;
+      evidence.push('patrón repetitivo de pie de página');
+      type = 'footer';
     }
-    
-    // Análisis 3: Patrones de texto
-    const fullText = lineData.map(item => item.text).join(' ');
-    
-    const examPatterns = [
-      /EXAMEN\s+(?:RE\s*)?PASO/i,
-      /EXAMEN\s+COMÚN/i,
-      /SAS\b/i,
-      /\d{1,2}\s+DE\s+(?:ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)\s+\d{4}/i,
-      /\d{1,2}\/\d{1,2}\/\d{2,4}/,
-      /ACADEMIA\s+\w+\s+FORMACIÓN/i,
-      /DOBLER\s+FORMACIÓN/i,
-      /Página\s+\d+/i,
-      /Pág\.\s+\d+/i
+
+    // 3. ANÁLISIS DE PATRONES ESPECÍFICOS (peso alto)
+    const specificPatterns = [
+      // Patrones de examen y fechas
+      { regex: /EXAMEN\s+(?:RE\s*)?PASO/i, weight: 4, desc: 'patrón de examen PASO' },
+      { regex: /EXAMEN\s+COMÚN/i, weight: 4, desc: 'patrón de examen común' },
+      { regex: /\b\d{1,2}\s+DE\s+(?:ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)\s+DE\s+\d{4}\b/i, weight: 5, desc: 'fecha completa' },
+      { regex: /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/, weight: 3, desc: 'fecha numérica' },
+      
+      // Patrones de academia/institución
+      { regex: /ACADEMIA\s+\w+\s+FORMACIÓN/i, weight: 4, desc: 'nombre de academia' },
+      { regex: /DOBLER\s+FORMACIÓN/i, weight: 4, desc: 'institución específica' },
+      { regex: /\bSAS\b|\bSERGAS\b|\bSESPA\b/i, weight: 3, desc: 'servicio de salud' },
+      
+      // Patrones de numeración de páginas
+      { regex: /Página\s+\d+\s*(?:de\s+\d+)?/i, weight: 5, desc: 'numeración de página' },
+      { regex: /Pág\.\s*\d+/i, weight: 5, desc: 'numeración abreviada' },
+      { regex: /\b\d+\s*\/\s*\d+\b/, weight: 2, desc: 'numeración tipo fracción' },
+      
+      // Patrones de identificación de documento
+      { regex: /CÓDIGO\s*:?.*\w+/i, weight: 3, desc: 'código de documento' },
+      { regex: /ID\s*:?.*\d+/i, weight: 2, desc: 'identificador' },
+      { regex: /www\.\w+\.\w+/i, weight: 4, desc: 'URL web' },
+      { regex: /@\w+\.\w+/i, weight: 3, desc: 'email' },
+      
+      // Patrones de copyright y derechos
+      { regex: /©|\bcopyright\b|todos\s+los\s+derechos\s+reservados/i, weight: 4, desc: 'copyright' },
+      { regex: /prohibida\s+(?:la\s+)?reproducción/i, weight: 4, desc: 'aviso de reproducción' }
     ];
-    
-    const hasExamPattern = examPatterns.some(pattern => pattern.test(fullText));
-    if (hasExamPattern) {
-      headerFooterScore += 4;
-      evidence.push('patrón de examen/fecha detectado');
+
+    specificPatterns.forEach(pattern => {
+      if (pattern.regex.test(line.text)) {
+        score += pattern.weight;
+        evidence.push(pattern.desc);
+      }
+    });
+
+    // 4. ANÁLISIS DE TAMAÑO DE FUENTE
+    if (line.avgFontSize < globalAnalysis.documentInfo.avgFontSize * 0.7) {
+      score += 2;
+      evidence.push('fuente más pequeña que promedio');
+    } else if (line.avgFontSize > globalAnalysis.documentInfo.avgFontSize * 1.5) {
+      score += 1;
+      evidence.push('fuente más grande que promedio');
     }
-    
-    // Análisis 4: Ancho del texto
-    const totalWidth = lineData.reduce((sum, item) => sum + (item.width || 0), 0);
-    const relativeWidth = totalWidth / viewport.width;
-    
-    if (relativeWidth > 0.8 || relativeWidth < 0.2) {
-      headerFooterScore += 2;
-      evidence.push('ancho de texto atípico');
+
+    // 5. ANÁLISIS DE ANCHO DEL TEXTO
+    const relativeWidth = line.totalWidth / viewport.width;
+    if (relativeWidth < 0.3) {
+      score += 2;
+      evidence.push('texto muy estrecho');
+    } else if (relativeWidth > 0.9) {
+      score += 1;
+      evidence.push('texto muy ancho');
     }
-    
-    // Análisis 5: Consistencia de estilo
-    const fontStyles = [...new Set(lineData.map(item => item.fontStyle))];
-    if (fontStyles.length > 2) {
-      headerFooterScore += 1;
-      evidence.push('múltiples estilos de fuente');
+
+    // 6. ANÁLISIS DE CONTENIDO CORTO
+    if (line.text.length < 50 && (line.relativeY < 0.15 || line.relativeY > 0.85)) {
+      score += 2;
+      evidence.push('texto corto en posición extrema');
     }
-    
-    // Decisión final basada en puntuación acumulada
-    if (headerFooterScore >= 5) {
-      return {
-        type: headerFooterScore >= 7 ? 'encabezado/pie_confiable' : 'posible_encabezado/pie',
-        confidence: Math.min(headerFooterScore * 10, 90),
-        evidence: evidence
-      };
+
+    // 7. ANÁLISIS DE TEXTO EN MAYÚSCULAS
+    if (line.text === line.text.toUpperCase() && line.text.length > 5) {
+      score += 1;
+      evidence.push('texto en mayúsculas');
     }
-    
-    return false;
+
+    // DECISIÓN FINAL
+    const isHeaderFooter = score >= 4; // Umbral reducido para mayor sensibilidad
+    const confidence = Math.min((score / 10) * 100, 95);
+
+    return {
+      isHeaderFooter,
+      type: isHeaderFooter ? type : 'content',
+      confidence,
+      evidence,
+      score
+    };
+  };
+
+  // FUNCIÓN NUEVA: Post-procesamiento del texto extraído
+  const postProcessExtractedText = (text, globalAnalysis) => {
+    let cleanedText = text;
+
+    // Eliminar líneas vacías múltiples
+    cleanedText = cleanedText.replace(/\n\s*\n\s*\n/g, '\n\n');
+
+    // Eliminar espacios extra al inicio y final de líneas
+    cleanedText = cleanedText.split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0)
+      .join('\n');
+
+    // Mejorar formato de preguntas y opciones
+    cleanedText = cleanedText.replace(/(\d+)[.\-\\)](\s*)([A-Z])/g, '$1.$2$3');
+    cleanedText = cleanedText.replace(/([a-zA-Z])[.\-\\)](\s*)([A-Z])/g, '$1) $3');
+
+    return cleanedText;
   };
 
   const extractTextWithFallback = async (file) => {
-    // Método de respaldo: leer como texto plano (para PDFs simples o dañados)
+    // Método de respaldo mejorado
     return new Promise((resolve) => {
       const reader = new FileReader();
       reader.onload = (e) => {
-        // Intentar extraer texto legible del contenido binario
-        const binary = e.target.result;
-        const text = new TextDecoder('utf-8').decode(binary);
-        
-        // Buscar patrones de preguntas y opciones en el texto binario
-        const lines = text.split('\n');
-        let extractedText = '';
-        let inQuestion = false;
-        let questionBuffer = '';
-        
-        lines.forEach(line => {
-          // Limpiar la línea de caracteres no imprimibles
-          const cleanLine = line.replace(/[^\x20-\x7E\n\r]/g, '').trim();
+        try {
+          const binary = e.target.result;
+          const text = new TextDecoder('utf-8', { fatal: false }).decode(binary);
           
-          if (cleanLine) {
-            // Detectar si es una pregunta (comienza con número)
-            if (/^\d+[.\-)]/.test(cleanLine)) {
-              if (questionBuffer) {
-                extractedText += questionBuffer + '\n';
+          // Buscar patrones de preguntas y opciones más robustamente
+          const lines = text.split(/[\n\r]+/);
+          let extractedText = '';
+          let currentQuestion = '';
+          let inQuestion = false;
+          
+          lines.forEach(line => {
+            const cleanLine = line.replace(/[^
+\x20-\x7E\u00C0-\u017F]/g, '').trim();
+            
+            if (cleanLine.length < 3) return;
+            
+            // Patrón de pregunta mejorado
+            if (/^\d+[.\-\\)]\s*.{10,}/i.test(cleanLine)) {
+              if (currentQuestion) {
+                extractedText += currentQuestion + '\n\n';
               }
-              questionBuffer = cleanLine;
+              currentQuestion = cleanLine;
               inQuestion = true;
             }
-            // Detectar si es una opción (comienza con letra)
-            else if (/^[a-zA-Z][.\-)]/.test(cleanLine) && inQuestion) {
-              questionBuffer += '\n' + cleanLine;
+            // Patrón de opción mejorado
+            else if (/^[a-zA-Z][.\-\\)]\s*.{2,}/i.test(cleanLine) && inQuestion) {
+              currentQuestion += '\n' + cleanLine;
             }
-            // Si es texto adicional de la pregunta
-            else if (inQuestion && !/^[a-zA-Z][.\-)]/.test(cleanLine)) {
-              questionBuffer += ' ' + cleanLine;
-            }
-            // Si es una nueva línea que no es opción, terminar la pregunta actual
-            else if (inQuestion && !/^[a-zA-Z][.\-)]/.test(cleanLine)) {
-              if (questionBuffer) {
-                extractedText += questionBuffer + '\n\n';
+            // Continuación de pregunta
+            else if (inQuestion && cleanLine && !/^\d+[.\-\\)]/.test(cleanLine)) {
+              if (currentQuestion && !currentQuestion.endsWith('.') && !currentQuestion.endsWith('?')) {
+                currentQuestion += ' ' + cleanLine;
               }
-              questionBuffer = '';
-              inQuestion = false;
             }
+          });
+          
+          if (currentQuestion) {
+            extractedText += currentQuestion + '\n';
           }
-        });
-        
-        // Agregar la última pregunta si existe
-        if (questionBuffer) {
-          extractedText += questionBuffer + '\n';
+          
+          resolve(extractedText || 'No se pudo extraer texto legible del PDF. Intenta con un PDF diferente.');
+        } catch (error) {
+          resolve('Error en el método de respaldo. El PDF podría estar dañado o protegido.');
         }
-        
-        resolve(extractedText || 'No se pudo extraer texto legible del PDF. El archivo podría estar protegido o dañado.');
       };
       reader.readAsArrayBuffer(file);
     });
@@ -357,8 +493,8 @@ const PDFUploader = ({ onFileUpload }) => {
         {isProcessing ? (
           <div className="processing">
             <div className="spinner"></div>
-            <p>Extrayendo texto del PDF...</p>
-            <small>Esto puede tardar unos segundos dependiendo del tamaño del archivo</small>
+            <p>Analizando estructura del PDF...</p>
+            <small>Detectando encabezados, pies de página y extrayendo contenido limpio</small>
           </div>
         ) : (
           <>
@@ -370,7 +506,7 @@ const PDFUploader = ({ onFileUpload }) => {
               <polyline points="10 9 9 9 8 9"></polyline>
             </svg>
             <p>Arrastra y suelta tu archivo PDF aquí o haz clic para seleccionar</p>
-            <small>Solo archivos PDF</small>
+            <small>Detección avanzada de encabezados y pies de página mejorada</small>
           </>
         )}
       </div>
