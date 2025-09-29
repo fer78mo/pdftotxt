@@ -1,0 +1,52 @@
+.text-editor {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: 10px;
+}
+
+.editor-controls {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+
+.editor-controls button {
+    padding: 8px;
+    margin-right: 5px;
+    cursor: pointer;
+}
+
+.marker-section {
+    display: flex;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+}
+
+.marker {
+    background-color: yellow;
+    border-radius: 3px;
+    padding: 2px 5px;
+    margin-right: 5px;
+}
+
+.preview-panel {
+    border: 1px solid #ccc;
+    padding: 10px;
+    overflow-y: auto;
+    height: 300px; /* Adjust height as necessary */
+}
+
+@media (max-width: 768px) {
+    .editor-controls {
+        flex-direction: column;
+    }
+
+    .editor-controls button {
+        margin-bottom: 5px;
+    }
+
+    .preview-panel {
+        height: 200px; /* Adjust height for smaller screens */
+    }
+}
